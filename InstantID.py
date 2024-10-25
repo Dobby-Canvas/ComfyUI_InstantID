@@ -8,7 +8,7 @@ import cv2
 import PIL.Image
 from .resampler import Resampler
 from .CrossAttentionPatch import Attn2Replace, instantid_attention
-from .utils import tensor_to_image
+from .utils import tensor_to_image, image_to_tensor
 
 from insightface.app import FaceAnalysis
 
@@ -27,6 +27,77 @@ else:
 folder_paths.folder_names_and_paths["instantid"] = (current_paths, folder_paths.supported_pt_extensions)
 
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
+
+def detect_anime_face(image: np.ndarray):
+    import animeface
+    image = PIL.Image.fromarray(image)
+    face =  animeface.detect(image)
+
+    if not face:
+        raise Exception('AnimeFace: No face detected.')
+    left_eye = face[0].left_eye.pos  # 왼쪽 눈 좌표
+    right_eye = face[0].right_eye.pos  # 오른쪽 눈 좌표
+    nose = face[0].nose.pos  # 코 끝 좌표
+    mouth = face[0].mouth.pos  # 입의 좌표 (중앙을 기준으로)
+
+    left_mouth_corner = ( mouth.x, mouth.y)  # 왼쪽 입꼬리
+    right_mouth_corner = (mouth.x + mouth.width, mouth.y + mouth.height)  # 오른쪽 입꼬리
+    left_eye_center = (left_eye.x + left_eye.width // 2, left_eye.y + left_eye.height // 2)  # 왼쪽 눈 중심
+    right_eye_center = (right_eye.x + right_eye.width // 2, right_eye.y + right_eye.height // 2)  # 오른쪽 눈 중심
+    
+    # 랜드마크 포인트 좌표를 딕셔너리로 반환
+    landmarks = {
+        'left_eye': left_eye_center,  # (x, y)
+        'right_eye': right_eye_center,  # (x, y)
+        'nose': (nose.x, nose.y),  # (x, y)
+        'left_mouth_corner': left_mouth_corner,  # (x, y)
+        'right_mouth_corner': right_mouth_corner  # (x, y)
+    }
+
+    return landmarks
+
+def draw_anime_kps(image_np, landmarks, color_list=[(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255), (255, 0, 255)]):
+    print(image_np.shape)
+    print("/////////////////////////////")
+    image = np.zeros(image_np.shape, dtype=np.uint8)
+    cv2.line(image, landmarks['nose'], landmarks['left_eye'], color_list[0], 3)  # Red: Nose to left eye
+    cv2.line(image, landmarks['nose'], landmarks['right_eye'], color_list[1], 3)  # Green: Nose to right eye
+    cv2.line(image, landmarks['nose'], landmarks['left_mouth_corner'], color_list[3], 3)  # Yellow: Nose to left mouth
+    cv2.line(image, landmarks['nose'], landmarks['right_mouth_corner'], color_list[4], 3)  # Magenta: Nose to right mouth
+
+    # Drawing points
+    cv2.circle(image, landmarks['nose'], 8, color_list[2], -1)  # Blue: Nose
+    cv2.circle(image, landmarks['left_eye'], 8, color_list[0], -1)  # Red: Left eye
+    cv2.circle(image, landmarks['right_eye'], 8, color_list[1], -1)  # Green: Right eye
+    cv2.circle(image, landmarks['left_mouth_corner'], 8, color_list[3], -1)  # Yellow: Left mouth
+    cv2.circle(image, landmarks['right_mouth_corner'], 8, color_list[4], -1)  # Magenta: Right mouth
+    # Convert to tensor
+    tensor_image = image_to_tensor(image)
+    
+    # Ensure the tensor has the correct shape (H, W, C)
+    if tensor_image.shape[0] == 3 and tensor_image.shape[2] != 3:
+        tensor_image = tensor_image.permute(1, 2, 0)
+    
+    return tensor_image
+
+class InstantIDAnimeFaceAnalysis:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"images": ("IMAGE", )}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "anime_face_analysis"
+    CATEGORY = "InstantID"
+
+    def anime_face_analysis(self, images):
+
+        results = []
+        for image in images:
+            image_np = tensor_to_image(image)
+            landmarks = detect_anime_face(image_np)
+            results.append(draw_anime_kps(image_np, landmarks))
+        result = torch.stack(results, dim=0)
+        return (result,)
 
 def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255)]):
     stickwidth = 4
@@ -200,12 +271,29 @@ def extractFeatures(insightface, image, extract_kps=False):
 
     return out
 
+def force_embedding_with_face(faceanalysis, image):
+    # blob = cv2.dnn.blobFromImage(image)
+    # faceanalysis.models['recognition'].model.input_blob = 'data'
+    # faceanalysis.models['recognition'].model.output_blob = '_output_'
+    # embedding = faceanalysis.models['recognition'].model.forward(blob)[0]
+    from insightface.utils import face_align
+    image = cv2.resize(image, (112, 112))
+    # 배치 차원 추가
+    print(image)
+    print(image.shape)
+    print("//////////////////////")
+    # image = np.expand_dims(image, axis=0)
+    
+    # 임베딩 추출
+    embedding = faceanalysis.models['recognition'].get_feat(image)
+    return torch.from_numpy(embedding).unsqueeze(0)
+
 class InstantIDFaceAnalysis:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "provider": (["CPU", "CUDA", "ROCM", "CoreML"], ),
+                "provider": (["CPU", "CUDA", "ROCM"], ),
             },
         }
 
@@ -302,6 +390,161 @@ class ApplyInstantID:
 
         clip_embed = face_embed
         # InstantID works better with averaged embeds (TODO: needs testing)
+        if clip_embed.shape[0] > 1:
+            if combine_embeds == 'average':
+                clip_embed = torch.mean(clip_embed, dim=0).unsqueeze(0)
+            elif combine_embeds == 'norm average':
+                clip_embed = torch.mean(clip_embed / torch.norm(clip_embed, dim=0, keepdim=True), dim=0).unsqueeze(0)
+
+        if noise > 0:
+            seed = int(torch.sum(clip_embed).item()) % 1000000007
+            torch.manual_seed(seed)
+            clip_embed_zeroed = noise * torch.rand_like(clip_embed)
+            #clip_embed_zeroed = add_noise(clip_embed, noise)
+        else:
+            clip_embed_zeroed = torch.zeros_like(clip_embed)
+
+        # 1: patch the attention
+        self.instantid = instantid
+        self.instantid.to(self.device, dtype=self.dtype)
+
+        image_prompt_embeds, uncond_image_prompt_embeds = self.instantid.get_image_embeds(clip_embed.to(self.device, dtype=self.dtype), clip_embed_zeroed.to(self.device, dtype=self.dtype))
+
+        image_prompt_embeds = image_prompt_embeds.to(self.device, dtype=self.dtype)
+        uncond_image_prompt_embeds = uncond_image_prompt_embeds.to(self.device, dtype=self.dtype)
+
+        work_model = model.clone()
+
+        sigma_start = model.get_model_object("model_sampling").percent_to_sigma(start_at)
+        sigma_end = model.get_model_object("model_sampling").percent_to_sigma(end_at)
+
+        if mask is not None:
+            mask = mask.to(self.device)
+
+        patch_kwargs = {
+            "ipadapter": self.instantid,
+            "weight": ip_weight,
+            "cond": image_prompt_embeds,
+            "uncond": uncond_image_prompt_embeds,
+            "mask": mask,
+            "sigma_start": sigma_start,
+            "sigma_end": sigma_end,
+        }
+
+        number = 0
+        for id in [4,5,7,8]: # id of input_blocks that have cross attention
+            block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
+            for index in block_indices:
+                patch_kwargs["module_key"] = str(number*2+1)
+                _set_model_patch_replace(work_model, patch_kwargs, ("input", id, index))
+                number += 1
+        for id in range(6): # id of output_blocks that have cross attention
+            block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
+            for index in block_indices:
+                patch_kwargs["module_key"] = str(number*2+1)
+                _set_model_patch_replace(work_model, patch_kwargs, ("output", id, index))
+                number += 1
+        for index in range(10):
+            patch_kwargs["module_key"] = str(number*2+1)
+            _set_model_patch_replace(work_model, patch_kwargs, ("middle", 1, index))
+            number += 1
+
+        # 2: do the ControlNet
+        if mask is not None and len(mask.shape) < 3:
+            mask = mask.unsqueeze(0)
+
+        cnets = {}
+        cond_uncond = []
+
+        is_cond = True
+        for conditioning in [positive, negative]:
+            c = []
+            for t in conditioning:
+                d = t[1].copy()
+
+                prev_cnet = d.get('control', None)
+                if prev_cnet in cnets:
+                    c_net = cnets[prev_cnet]
+                else:
+                    c_net = control_net.copy().set_cond_hint(face_kps.movedim(-1,1), cn_strength, (start_at, end_at))
+                    c_net.set_previous_controlnet(prev_cnet)
+                    cnets[prev_cnet] = c_net
+
+                d['control'] = c_net
+                d['control_apply_to_uncond'] = False
+                d['cross_attn_controlnet'] = image_prompt_embeds.to(comfy.model_management.intermediate_device(), dtype=c_net.cond_hint_original.dtype) if is_cond else uncond_image_prompt_embeds.to(comfy.model_management.intermediate_device(), dtype=c_net.cond_hint_original.dtype)
+
+                if mask is not None and is_cond:
+                    d['mask'] = mask
+                    d['set_area_to_bounds'] = False
+
+                n = [t[0], d]
+                c.append(n)
+            cond_uncond.append(c)
+            is_cond = False
+
+        return(work_model, cond_uncond[0], cond_uncond[1], )
+    
+
+
+class ApplyInstantIDAnime:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "instantid": ("INSTANTID", ),
+                "insightface": ("FACEANALYSIS", ),
+                "control_net": ("CONTROL_NET", ),
+                "image": ("IMAGE", ),
+                "model": ("MODEL", ),
+                "positive": ("CONDITIONING", ),
+                "negative": ("CONDITIONING", ),
+                "weight": ("FLOAT", {"default": .8, "min": 0.0, "max": 5.0, "step": 0.01, }),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, }),
+            },
+            "optional": {
+                "image_kps": ("IMAGE",),
+                "mask": ("MASK",),
+                "face_image": ("IMAGE",),
+            
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING",)
+    RETURN_NAMES = ("MODEL", "positive", "negative", )
+    FUNCTION = "apply_instantid"
+    CATEGORY = "InstantID"
+
+    def apply_instantid(self, instantid, insightface, control_net, image, model, positive, negative, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None, combine_embeds='average', face_image=None):
+        dtype = comfy.model_management.unet_dtype()
+        if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
+        
+        self.dtype = dtype
+        self.device = comfy.model_management.get_torch_device()
+
+        ip_weight = weight if ip_weight is None else ip_weight
+        cn_strength = weight if cn_strength is None else cn_strength
+
+        face_embed = extractFeatures(insightface, image)
+        if face_embed is None:
+          
+            # face_embed = clip_embed["image_embeds"].unsqueeze(0)
+            face_embed = force_embedding_with_face(insightface, tensor_to_image(face_image)[0])
+        # if no keypoints image is provided, use the image itself (only the first one in the batch)
+        face_kps = extractFeatures(insightface, image_kps if image_kps is not None else image[0].unsqueeze(0), extract_kps=True)
+
+        if face_kps is None:
+            face_kps = torch.zeros_like(image) if image_kps is None else image_kps
+            print(f"\033[33mWARNING: No face detected in the keypoints image!\033[0m")
+
+        clip_embed = face_embed
+        # InstantID works better with averaged embeds (TODO: needs testing)
+        print(clip_embed)
+        print(clip_embed.shape)
+        print("//////////////////////")
+        
         if clip_embed.shape[0] > 1:
             if combine_embeds == 'average':
                 clip_embed = torch.mean(clip_embed, dim=0).unsqueeze(0)
@@ -597,6 +840,9 @@ NODE_CLASS_MAPPINGS = {
 
     "InstantIDAttentionPatch": InstantIDAttentionPatch,
     "ApplyInstantIDControlNet": ApplyInstantIDControlNet,
+
+    "InstantIDAnimeFaceAnalysis": InstantIDAnimeFaceAnalysis,
+    "ApplyInstantIDAnime": ApplyInstantIDAnime,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -608,4 +854,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
     "InstantIDAttentionPatch": "InstantID Patch Attention",
     "ApplyInstantIDControlNet": "InstantID Apply ControlNet",
+
+    "InstantIDAnimeFaceAnalysis": "InstantID Anime Face Analysis",
+    "ApplyInstantIDAnime": "Apply InstantID Anime",
 }
