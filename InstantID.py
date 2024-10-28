@@ -10,6 +10,8 @@ from .resampler import Resampler
 from .CrossAttentionPatch import Attn2Replace, instantid_attention
 from .utils import tensor_to_image, image_to_tensor
 
+import animeface
+from ultralytics import YOLO
 from insightface.app import FaceAnalysis
 
 try:
@@ -28,8 +30,22 @@ folder_paths.folder_names_and_paths["instantid"] = (current_paths, folder_paths.
 
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 
-def detect_anime_face(image: np.ndarray):
-    import animeface
+def detect_yolov8_face(images: torch.Tensor):
+    model_path = os.path.join(folder_paths.models_dir, "ultralytics/bbox/face_yolov8m.pt")
+    model = YOLO(model_path)
+    results = []
+    for image in images:
+        image = tensor_to_image(image)
+        pred = model.predict(image)
+        bboxes = pred[0].boxes.xyxy.cpu().numpy()
+        # crop face
+        face_image = image[int(bboxes[0][1]):int(bboxes[0][3]), int(bboxes[0][0]):int(bboxes[0][2])]
+        results.append(image_to_tensor(face_image))
+    result = torch.stack(results, dim=0)
+    return result
+    
+def detect_animeface_face(image: np.ndarray):
+    
     image = PIL.Image.fromarray(image)
     face =  animeface.detect(image)
 
@@ -54,11 +70,14 @@ def detect_anime_face(image: np.ndarray):
         'right_mouth_corner': right_mouth_corner  # (x, y)
     }
 
-    return landmarks
+    face_image = face_crop(image, face[0].face.pos)
+    return landmarks, face_image
+
+def face_crop(image: PIL.Image.Image, pos):
+    image = image.crop((pos.x, pos.y, pos.x + pos.width, pos.y + pos.height))
+    return image_to_tensor(np.array(image))
 
 def draw_anime_kps(image_np, landmarks, color_list=[(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255), (255, 0, 255)]):
-    print(image_np.shape)
-    print("/////////////////////////////")
     image = np.zeros(image_np.shape, dtype=np.uint8)
     cv2.line(image, landmarks['nose'], landmarks['left_eye'], color_list[0], 3)  # Red: Nose to left eye
     cv2.line(image, landmarks['nose'], landmarks['right_eye'], color_list[1], 3)  # Green: Nose to right eye
@@ -85,19 +104,27 @@ class InstantIDAnimeFaceAnalysis:
     def INPUT_TYPES(s):
         return {"required": {"images": ("IMAGE", )}}
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "IMAGE",)
+    RETURN_NAMES = ("kps", "face",)
     FUNCTION = "anime_face_analysis"
     CATEGORY = "InstantID"
 
     def anime_face_analysis(self, images):
 
-        results = []
+        kps_results = []
+        face_results = []
         for image in images:
             image_np = tensor_to_image(image)
-            landmarks = detect_anime_face(image_np)
-            results.append(draw_anime_kps(image_np, landmarks))
-        result = torch.stack(results, dim=0)
-        return (result,)
+            landmarks, face_image = detect_animeface_face(image_np)
+            kps_results.append(draw_anime_kps(image_np, landmarks))
+            face_results.append(face_image)
+
+        kps_result = torch.stack(kps_results, dim=0)
+        face_result = torch.stack(face_results, dim=0)
+
+        print(kps_result.shape)
+        print(face_result.shape)
+        return (kps_result, face_result)
 
 def draw_kps(image_pil, kps, color_list=[(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255)]):
     stickwidth = 4
@@ -271,22 +298,18 @@ def extractFeatures(insightface, image, extract_kps=False):
 
     return out
 
-def force_embedding_with_face(faceanalysis, image):
-    # blob = cv2.dnn.blobFromImage(image)
-    # faceanalysis.models['recognition'].model.input_blob = 'data'
-    # faceanalysis.models['recognition'].model.output_blob = '_output_'
-    # embedding = faceanalysis.models['recognition'].model.forward(blob)[0]
-    from insightface.utils import face_align
-    image = cv2.resize(image, (112, 112))
-    # 배치 차원 추가
-    print(image)
-    print(image.shape)
-    print("//////////////////////")
-    # image = np.expand_dims(image, axis=0)
+def force_embedding_with_face(faceanalysis, images):
+    embeddings = []
+    if not isinstance(images, np.ndarray):
+        images = tensor_to_image(images)
+    for image in images:
+        image = cv2.resize(image, (112, 112))
     
-    # 임베딩 추출
-    embedding = faceanalysis.models['recognition'].get_feat(image)
-    return torch.from_numpy(embedding).unsqueeze(0)
+        embedding = faceanalysis.models['recognition'].get_feat(image)
+        embedding = torch.from_numpy(embedding)
+        embeddings.append(embedding)
+
+    return torch.stack(embeddings, dim=0)
 
 class InstantIDFaceAnalysis:
     @classmethod
@@ -383,11 +406,11 @@ class ApplyInstantID:
 
         # if no keypoints image is provided, use the image itself (only the first one in the batch)
         face_kps = extractFeatures(insightface, image_kps if image_kps is not None else image[0].unsqueeze(0), extract_kps=True)
-
+        
         if face_kps is None:
             face_kps = torch.zeros_like(image) if image_kps is None else image_kps
             print(f"\033[33mWARNING: No face detected in the keypoints image!\033[0m")
-
+      
         clip_embed = face_embed
         # InstantID works better with averaged embeds (TODO: needs testing)
         if clip_embed.shape[0] > 1:
@@ -527,23 +550,23 @@ class ApplyInstantIDAnime:
         ip_weight = weight if ip_weight is None else ip_weight
         cn_strength = weight if cn_strength is None else cn_strength
 
+        
         face_embed = extractFeatures(insightface, image)
         if face_embed is None:
-          
-            # face_embed = clip_embed["image_embeds"].unsqueeze(0)
-            face_embed = force_embedding_with_face(insightface, tensor_to_image(face_image)[0])
-        # if no keypoints image is provided, use the image itself (only the first one in the batch)
+            if face_image is None:
+                face_image = detect_yolov8_face(image)
+            face_embed = force_embedding_with_face(insightface, face_image)
+            print("force embedding")
+     
+        
         face_kps = extractFeatures(insightface, image_kps if image_kps is not None else image[0].unsqueeze(0), extract_kps=True)
 
         if face_kps is None:
             face_kps = torch.zeros_like(image) if image_kps is None else image_kps
             print(f"\033[33mWARNING: No face detected in the keypoints image!\033[0m")
-
+  
         clip_embed = face_embed
         # InstantID works better with averaged embeds (TODO: needs testing)
-        print(clip_embed)
-        print(clip_embed.shape)
-        print("//////////////////////")
         
         if clip_embed.shape[0] > 1:
             if combine_embeds == 'average':
